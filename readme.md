@@ -4,6 +4,5 @@ sym link this with the repo
 
 ## using tool
 to run tool against test code:
-- `make build-tool`
 - `make pin`
 
