@@ -224,8 +224,8 @@ static void print_memory_layout(void) {
  * Main
  * ========================================================================= */
 int main(int argc, char* argv[]) {
-    int      nthreads   = (argc > 1) ? atoi(argv[1])        : DEFAULT_THREADS;
-    uint64_t iterations = (argc > 2) ? (uint64_t)atoll(argv[2]) : DEFAULT_ITERATIONS;
+    int      nthreads   = (argc > 1) ? atoi(argv[1]) : DEFAULT_THREADS;
+    uint64_t iterations = DEFAULT_ITERATIONS;
 
     if (nthreads < 1 || nthreads > MAX_THREADS) {
         fprintf(stderr, "Thread count must be between 1 and %d\n", MAX_THREADS);

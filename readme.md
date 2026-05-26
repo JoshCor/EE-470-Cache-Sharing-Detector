@@ -6,3 +6,11 @@ sym link this with the repo
 to run tool against test code:
 - `make pin`
 
+## Programs testing against
+- pbzip2
+- xz
+
+
+When testing these linux compression tools, run them against data in the TestingData folder. 
+Randomly generate using this command:
+`dd if=/dev/urandom of=TestingData/testfile.bin bs=1M count=200`

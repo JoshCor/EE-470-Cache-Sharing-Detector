@@ -1,112 +1,62 @@
-# =============================================================================
-# Makefile — false sharing detector
+# Targets:
+#   make tool                  build the PIN tool .so
+#   make benchmark             compile both benchmark programs
+#   make run CMD="..."         run any command natively (baseline timing)
+#   make pin CMD="..."         run any command under PIN
+#   make clean                 remove build artifacts and logs
 #
-# Usage:
-#   make                                          build default benchmark (simple_benchmark)
-#   make PROGRAM=false_sharing_benchmark          build a specific benchmark
-#   make run                                      run natively with default args
-#   make run PROGRAM=false_sharing_benchmark SCENARIO=0 THREADS=4 ITERATIONS=10000000
-#   make pin                                      build PIN tool (if stale) and run under PIN
-#   make pin PROGRAM=false_sharing_benchmark SCENARIO=1
-#   make clean                                    remove all build artifacts and logs
-# =============================================================================
+# CMD aliases:
+#   make pin CMD='$(SIMPLE)'
+#   make pin CMD='$(FALSE_SHARING)'
+#   make pin CMD='$(PBZIP2)'
+#   make pin CMD='$(XZ)'
 
-CC           = gcc
-CFLAGS       = -O0 -g -pthread -Wall -Wextra
+CC     = gcc
+CFLAGS = -O0 -g -pthread -Wall -Wextra
 
-# -----------------------------------------------------------------------------
-# Benchmark selection
-# Override on the command line: make PROGRAM=false_sharing_benchmark
-# Defaults to simple_benchmark which has exactly one false sharing instance —
-# use this during early tool development before adding complexity.
-# -----------------------------------------------------------------------------
-PROGRAM      ?= simple_benchmark
-SRC          = $(PROGRAM).c
-TARGET       = $(PROGRAM)
+THREADS ?= 4
 
-# -----------------------------------------------------------------------------
-# Workload parameters for false_sharing_benchmark
-# SCENARIO selects which memory access pattern to exercise (0-4)
-# These are ignored by simple_benchmark which takes no arguments
-#   0: false sharing
-#   1: no false sharing (padded)
-#   2: producer/consumer false sharing
-#   3: true sharing (data race, not false sharing)
-#   4: no sharing
-# -----------------------------------------------------------------------------
-SCENARIO     ?= 0
-THREADS      ?= 4
-ITERATIONS   ?= 10000000
+LOG_DIR = logs
 
-LOG_DIR      = logs
-
-# -----------------------------------------------------------------------------
-# PIN installation and tool paths
-# PIN_ROOT defaults to ~/pin-4.2 but can be overridden:
-#   make pin PIN_ROOT=/opt/pin-4.2
-# -----------------------------------------------------------------------------
 PIN_ROOT     ?= $(HOME)/pin-4.2
 PIN          = $(PIN_ROOT)/pin
-PIN_TOOL_DIR = $(PIN_ROOT)/source/tools/FalseSharingDetector
-TOOL         = $(PIN_TOOL_DIR)/obj-intel64/false_sharing_detector.so
+PIN_TOOL_DIR = $(PIN_ROOT)/source/tools/CacheSharingDetector
+TOOL         = $(PIN_TOOL_DIR)/obj-intel64/cache_sharing_detector.so
 
+# Comman aliases for common benchmarks and programs to run against
+SIMPLE        = ./simple_benchmark
+FALSE_SHARING = ./false_sharing_benchmark $(THREADS)
+PBZIP2        = pbzip2 -p$(THREADS) -k -f TestingData/testfile.bin
+XZ            = xz -T$(THREADS) -k -f TestingData/testfile.bin
 
-# =============================================================================
-# Build benchmark binary
-# =============================================================================
-.PHONY: all
-all: $(TARGET)
+.PHONY: tool
+tool:
+	$(MAKE) -C $(PIN_TOOL_DIR) obj-intel64/cache_sharing_detector.so
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SRC)
+.PHONY: benchmark
+benchmark: simple_benchmark false_sharing_benchmark
 
+simple_benchmark false_sharing_benchmark: %: %.c
+	$(CC) $(CFLAGS) -o $@ $<
 
-# =============================================================================
-# Run natively (no PIN)
-# Output is printed to terminal and saved to logs/native-<program>-<scenario>.log
-# Lets you measure baseline performance and verify counter values before
-# running under PIN.
-# =============================================================================
 .PHONY: run
-run: $(TARGET) $(LOG_DIR)
-	./$(TARGET) $(SCENARIO) $(THREADS) $(ITERATIONS) 2>&1 | tee $(LOG_DIR)/native-$(PROGRAM)-$(SCENARIO).log
+run: $(LOG_DIR)
+ifndef CMD
+	$(error CMD is not set. Usage: make run CMD="..." or make run CMD='$$(SIMPLE)')
+endif
+	time $(CMD) 2>&1 | tee $(LOG_DIR)/native-$$(echo "$(CMD)" | tr ' /' '__' | cut -c1-50).log
 
-
-# =============================================================================
-# Build PIN tool and run under PIN
-# The $(TOOL) rule below checks timestamps — if false_sharing_detector.cpp
-# is newer than the .so, the tool is rebuilt automatically before running.
-# Output is saved to logs/pin-<program>-<scenario>.log
-# =============================================================================
 .PHONY: pin
-pin: $(TARGET) $(TOOL) $(LOG_DIR)
-	$(PIN) -t $(TOOL) -- ./$(TARGET) $(SCENARIO) $(THREADS) $(ITERATIONS) 2>&1 | tee $(LOG_DIR)/pin-$(PROGRAM)-$(SCENARIO).log
+pin: $(LOG_DIR)
+ifndef CMD
+	$(error CMD is not set. Usage: make pin CMD="..." or make pin CMD='$$(SIMPLE)')
+endif
+	$(PIN) -t $(TOOL) -- $(CMD) 2>&1 | tee $(LOG_DIR)/pin-$$(echo "$(CMD)" | tr ' /' '__' | cut -c1-50).log
 
-
-# =============================================================================
-# Build PIN tool
-# Depends on the .cpp source so make detects changes and rebuilds when stale.
-# This was the root cause of the stale .so problem — without this dependency
-# make had no way to know the source had changed.
-# =============================================================================
-$(TOOL): $(PIN_TOOL_DIR)/false_sharing_detector.cpp
-	$(MAKE) -C $(PIN_TOOL_DIR) obj-intel64/false_sharing_detector.so
-
-
-# =============================================================================
-# Create log directory
-# =============================================================================
 $(LOG_DIR):
 	mkdir -p $(LOG_DIR)
 
-
-# =============================================================================
-# Clean
-# Removes the benchmark binary, the compiled PIN tool .so, and all logs.
-# Run this if you suspect a stale build.
-# =============================================================================
 .PHONY: clean
 clean:
-	rm -f $(TARGET)
-	rm -f $(TOOL)
+	rm -f simple_benchmark false_sharing_benchmark pin.log
 	rm -rf $(LOG_DIR)
