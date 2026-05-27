@@ -2,9 +2,13 @@
 #include <iostream>
 #include <unordered_map>
 #include <map>
+#include <set>
 #include <vector>
 #include <algorithm>
 #include <string>
+
+KNOB<std::string> KnobIpDump(KNOB_MODE_WRITEONCE, "pintool",
+    "ipdump", "ip_dump.txt", "path for IP dump file (binary, load base, and hotspot IPs)");
 
 #define CACHE_LINE_SIZE 64
 #define CACHE_LINE_MASK (~(ADDRINT)(CACHE_LINE_SIZE - 1))
@@ -26,15 +30,23 @@ struct CacheLineRecord {
 
 static std::unordered_map<ADDRINT, CacheLineRecord> instrumentation_records[MAX_THREADS];
 
+static std::string g_binary_path;
+static ADDRINT    g_load_base = 0;
+
+//grab path to the main binary and the relative address base for source lookup of instrumented binary
+VOID ImageLoad(IMG img, VOID* v) {
+    if (IMG_IsMainExecutable(img)) {
+        g_binary_path = IMG_Name(img);
+        g_load_base   = IMG_LowAddress(img);
+    }
+}
+
 // get data on a given memory access and store it in the larger datastructure
 VOID RecordAccess(VOID* addr, BOOL is_write, ADDRINT ip, THREADID tid) {
     ADDRINT mem_addr          = (ADDRINT)addr;
     ADDRINT cache_line = mem_addr & CACHE_LINE_MASK;
 
-    //needs looking at
-    //----------------
     CacheLineRecord& rec = instrumentation_records[tid].try_emplace(cache_line).first->second;
-    //----------------
 
     rec.reads  += is_write ? 0 : 1;
     rec.writes += is_write ? 1 : 0;
@@ -100,18 +112,6 @@ VOID Instruction(INS ins, VOID* v) {
 }
 
 
-// TODO: source location attribution
-// For each write IP in rec, resolve to file:line using PIN_GetSourceLocation
-// and print to stderr. Called per-thread per-hotspot during reporting.
-VOID ReportSourceLocations(const CacheLineRecord* rec) {
-    // for (uint8_t i = 0; i < rec->write_ip_count; i++) {
-    //     std::string file;
-    //     INT32 line = 0, col = 0;
-    //     PIN_GetSourceLocation(rec->write_ips[i], &col, &line, &file);
-    //     if (!file.empty())
-    //         std::cerr << "      write at " << file << ":" << line << "\n";
-    // }
-}
 
 VOID Fini(INT32 code, VOID* v) {
     std::map<ADDRINT, std::map<int, const CacheLineRecord*>> by_line;
@@ -127,7 +127,7 @@ VOID Fini(INT32 code, VOID* v) {
         }
     }
 
-    //define hotspot (false and true sharing) then set threshold for hotspot
+    //define hotspot (false, true, producer-consumer, read-sharing) then set threshold for hotspot
     struct Hotspot {
         ADDRINT  cache_line;
         uint64_t line_writes;
@@ -214,8 +214,6 @@ VOID Fini(INT32 code, VOID* v) {
             std::cerr << "    thread " << tid
                       << ": " << rec->writes << " writes, "
                       << rec->reads  << " reads\n";
-
-            ReportSourceLocations(rec); //stub to next task, report locations
         }
     }
 
@@ -225,11 +223,31 @@ VOID Fini(INT32 code, VOID* v) {
     std::cerr << "=========================================\n";
     std::cerr << "[detector] done. total writes observed: " << total_writes << "\n";
     std::cerr << "[detector] done. total reads observed: " << total_reads << "\n";
+
+    // write IP dump for source_lookup to resolve IPs -> file:line via DWARF
+    FILE* dump = fopen(KnobIpDump.Value().c_str(), "w");
+    if (dump) {
+        fprintf(dump, "binary:%s\n", g_binary_path.c_str());
+        fprintf(dump, "load_base:0x%lx\n", (unsigned long)g_load_base);
+        for (auto& hs : hotspots) {
+            for (auto& [tid, rec] : hs.threads) {
+                for (uint8_t i = 0; i < rec->write_ip_count; i++)
+                    fprintf(dump, "write %d 0x%lx\n", tid, (unsigned long)rec->write_ips[i]);
+                for (uint8_t i = 0; i < rec->read_ip_count; i++)
+                    fprintf(dump, "read %d 0x%lx\n", tid, (unsigned long)rec->read_ips[i]);
+            }
+        }
+        fclose(dump);
+        std::cerr << "[detector] IP dump written to: " << KnobIpDump.Value() << "\n";
+    } else {
+        std::cerr << "[detector] warning: could not open IP dump file: " << KnobIpDump.Value() << "\n";
+    }
 }
 
 int main(int argc, char* argv[]) {
-    PIN_InitSymbols();  // must come before PIN_Init for source location lookup to work
+    PIN_InitSymbols();
     PIN_Init(argc, argv);
+    IMG_AddInstrumentFunction(ImageLoad, nullptr);
     INS_AddInstrumentFunction(Instruction, nullptr);
     PIN_AddFiniFunction(Fini, nullptr);
     PIN_StartProgram();

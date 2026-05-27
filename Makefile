@@ -39,6 +39,9 @@ benchmark: simple_benchmark false_sharing_benchmark
 simple_benchmark false_sharing_benchmark: %: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+source_lookup: source_lookup.cpp
+	$(CXX) -O2 -o $@ $< $(shell pkg-config --cflags --libs libdw)
+
 .PHONY: run
 run: $(LOG_DIR)
 ifndef CMD
@@ -47,11 +50,13 @@ endif
 	time $(CMD) 2>&1 | tee $(LOG_DIR)/native-$$(echo "$(CMD)" | tr ' /' '__' | cut -c1-50).log
 
 .PHONY: pin
-pin: $(LOG_DIR)
+pin: $(LOG_DIR) source_lookup
 ifndef CMD
 	$(error CMD is not set. Usage: make pin CMD="..." or make pin CMD='$$(SIMPLE)')
 endif
-	$(PIN) -t $(TOOL) -- $(CMD) 2>&1 | tee $(LOG_DIR)/pin-$$(echo "$(CMD)" | tr ' /' '__' | cut -c1-50).log
+	base="$(LOG_DIR)/pin-$$(echo "$(CMD)" | tr ' /' '__' | cut -c1-50)" && \
+	$(PIN) -t $(TOOL) -ipdump $${base}-ips.txt -- $(CMD) 2>&1 | tee $${base}.log && \
+	./source_lookup $${base}-ips.txt
 
 $(LOG_DIR):
 	mkdir -p $(LOG_DIR)
