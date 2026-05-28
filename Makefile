@@ -26,7 +26,7 @@ TOOL         = $(PIN_TOOL_DIR)/obj-intel64/cache_sharing_detector.so
 # Comman aliases for common benchmarks and programs to run against
 SIMPLE        = ./simple_benchmark
 FALSE_SHARING = ./false_sharing_benchmark $(THREADS)
-PBZIP2        = pbzip2 -p$(THREADS) -k -f TestingData/testfile.bin
+PBZIP2        = "/home/josh/Documents/Repos From Source/pbzip2/pbz2" -p$(THREADS) -k -f TestingData/testfile.bin
 XZ            = xz -T$(THREADS) -k -f TestingData/testfile.bin
 
 .PHONY: tool
@@ -50,13 +50,19 @@ endif
 	time $(CMD) 2>&1 | tee $(LOG_DIR)/native-$$(echo "$(CMD)" | tr ' /' '__' | cut -c1-50).log
 
 .PHONY: pin
-pin: $(LOG_DIR) source_lookup
+pin: $(LOG_DIR)
 ifndef CMD
 	$(error CMD is not set. Usage: make pin CMD="..." or make pin CMD='$$(SIMPLE)')
 endif
 	base="$(LOG_DIR)/pin-$$(echo "$(CMD)" | tr ' /' '__' | cut -c1-50)" && \
-	$(PIN) -t $(TOOL) -ipdump $${base}-ips.txt -- $(CMD) 2>&1 | tee $${base}.log && \
-	./source_lookup $${base}-ips.txt
+	$(PIN) -t $(TOOL) -ipdump $${base}-ips.txt -- $(CMD) 2>&1 | tee $${base}.log
+
+.PHONY: lookup
+lookup: source_lookup
+ifndef CMD
+	$(error CMD is not set. Usage: make lookup CMD="...")
+endif
+	./source_lookup "$(LOG_DIR)/pin-$$(echo "$(CMD)" | tr ' /' '__' | cut -c1-50)-ips.txt"
 
 $(LOG_DIR):
 	mkdir -p $(LOG_DIR)

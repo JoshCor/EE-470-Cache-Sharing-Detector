@@ -30,16 +30,11 @@ struct CacheLineRecord {
 
 static std::unordered_map<ADDRINT, CacheLineRecord> instrumentation_records[MAX_THREADS];
 
-static std::string g_binary_path;
-static ADDRINT    g_load_base = 0;
+struct ImageInfo { std::string path; ADDRINT load_base; };
+static std::vector<ImageInfo> g_images;
 
-//grab path to the main binary and the relative address base for source lookup of instrumented binary
 VOID ImageLoad(IMG img, VOID* v) {
-    if(g_load_base != 0 || g_binary_path != "") return;
-    if (IMG_IsMainExecutable(img)) {
-        g_binary_path = IMG_Name(img);
-        g_load_base   = IMG_LowAddress(img);
-    }
+    g_images.push_back({IMG_Name(img), IMG_LowAddress(img)});
 }
 
 // get data on a given memory access and store it in the larger datastructure
@@ -56,17 +51,18 @@ VOID RecordAccess(VOID* addr, BOOL is_write, ADDRINT ip, THREADID tid) {
     else
         rec.read_mask  |= (1ULL << (mem_addr & (CACHE_LINE_SIZE - 1)));
 
-    if (is_write) {
+    //store instructon pointers in a list for up to MAX_TRACKED_IPS unique IPs
+    if (is_write && rec.write_ip_count < MAX_TRACKED_IPS) {
         bool found = false;
         for (uint8_t i = 0; i < rec.write_ip_count; i++)
             if (rec.write_ips[i] == ip) { found = true; break; }
-        if (!found && rec.write_ip_count < MAX_TRACKED_IPS)
+        if (!found)
             rec.write_ips[rec.write_ip_count++] = ip;
-    } else {
+    } else if (!is_write && rec.read_ip_count < MAX_TRACKED_IPS) {
         bool found = false;
         for (uint8_t i = 0; i < rec.read_ip_count; i++)
             if (rec.read_ips[i] == ip) { found = true; break; }
-        if (!found && rec.read_ip_count < MAX_TRACKED_IPS)
+        if (!found)
             rec.read_ips[rec.read_ip_count++] = ip;
     }
 }
@@ -228,8 +224,8 @@ VOID Fini(INT32 code, VOID* v) {
     // write IP dump for source_lookup to resolve IPs -> file:line via DWARF
     FILE* dump = fopen(KnobIpDump.Value().c_str(), "w");
     if (dump) {
-        fprintf(dump, "binary:%s\n", g_binary_path.c_str());
-        fprintf(dump, "load_base:0x%lx\n", (unsigned long)g_load_base);
+        for (auto& img : g_images)
+            fprintf(dump, "image:%s:0x%lx\n", img.path.c_str(), (unsigned long)img.load_base);
         for (auto& hs : hotspots) {
             for (auto& [tid, rec] : hs.threads) {
                 for (uint8_t i = 0; i < rec->write_ip_count; i++)
