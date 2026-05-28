@@ -53,6 +53,8 @@ testfile.bin.bz2
 # the binary for the testing file
 false_sharing_benchmark
 simple_benchmark
+source_lookup
+
 
 
 
