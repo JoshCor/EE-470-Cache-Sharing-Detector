@@ -35,6 +35,7 @@ static ADDRINT    g_load_base = 0;
 
 //grab path to the main binary and the relative address base for source lookup of instrumented binary
 VOID ImageLoad(IMG img, VOID* v) {
+    if(g_load_base != 0 || g_binary_path != "") return;
     if (IMG_IsMainExecutable(img)) {
         g_binary_path = IMG_Name(img);
         g_load_base   = IMG_LowAddress(img);

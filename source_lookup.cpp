@@ -76,7 +76,12 @@ int main(int argc, char* argv[]) {
             printf("thread %d  %-5s  0x%lx  ->  %s:%d\n",
                    tid, type, ip, filename ? filename : "(unknown)", lineno);
         } else {
-            printf("thread %d  %-5s  0x%lx  ->  (no debug info)\n", tid, type, ip);
+            // no line table entry — fall back to nearest symbol name
+            // (common for PLT stubs and compiler-generated prologue/epilogue code)
+            Dwfl_Module* mod = dwfl_addrmodule(dwfl, (Dwarf_Addr)ip);
+            const char* sym = mod ? dwfl_module_addrname(mod, (Dwarf_Addr)ip) : nullptr;
+            printf("thread %d  %-5s  0x%lx  ->  (no src - near symbol: %s)\n",
+                   tid, type, ip, sym ? sym : "unknown");
         }
     }
 
