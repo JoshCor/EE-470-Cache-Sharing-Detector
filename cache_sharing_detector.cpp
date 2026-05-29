@@ -13,103 +13,92 @@ KNOB<std::string> KnobIpDump(KNOB_MODE_WRITEONCE, "pintool",
 #define CACHE_LINE_SIZE 64
 #define CACHE_LINE_MASK (~(ADDRINT)(CACHE_LINE_SIZE - 1))
 #define MAX_THREADS 64
-#define WRITE_THRESHOLD_PERCENTAGE 0.1 //percentage threshold for hotspot 
+#define WRITE_THRESHOLD_PERCENTAGE 0.02 //percentage threshold for hotspot
 
 #define MAX_TRACKED_IPS 8
+#define SAMPLE_RATE     1          // record 1-in-N accesses; must be a power of two
 
 struct CacheLineRecord {
     uint64_t reads;
     uint64_t writes;
     uint64_t write_mask;
     uint64_t read_mask;
-    ADDRINT  write_ips[MAX_TRACKED_IPS];
-    ADDRINT  read_ips[MAX_TRACKED_IPS];
     uint8_t  write_ip_count;
     uint8_t  read_ip_count;
+    uint8_t  _pad[6];
+    //new cache line
+    ADDRINT  write_ips[MAX_TRACKED_IPS];
+    ADDRINT  read_ips[MAX_TRACKED_IPS];
 };
+struct alignas(CACHE_LINE_SIZE) SampleCounter { uint32_t val = 0; }; //prevents false sharing on the sample counters themselves (each cache line size)
+struct ImageInfo { std::string path; ADDRINT load_base; };
 
 static std::unordered_map<ADDRINT, CacheLineRecord> instrumentation_records[MAX_THREADS];
-
-struct ImageInfo { std::string path; ADDRINT load_base; };
+static SampleCounter g_sample_ctr[MAX_THREADS];
 static std::vector<ImageInfo> g_images;
 
+//load file and base address into vector for later use in source lookup with libdwfl
 VOID ImageLoad(IMG img, VOID* v) {
     g_images.push_back({IMG_Name(img), IMG_LowAddress(img)});
 }
 
-// get data on a given memory access and store it in the larger datastructure
-VOID RecordAccess(VOID* addr, BOOL is_write, ADDRINT ip, THREADID tid) {
-    ADDRINT mem_addr          = (ADDRINT)addr;
+//collect data if write operation
+VOID RecordWrite(VOID* addr, ADDRINT ip, THREADID tid) {
+    if (g_sample_ctr[tid].val++ & (SAMPLE_RATE - 1)) return;
+    ADDRINT mem_addr   = (ADDRINT)addr;
     ADDRINT cache_line = mem_addr & CACHE_LINE_MASK;
 
     CacheLineRecord& rec = instrumentation_records[tid].try_emplace(cache_line).first->second;
 
-    rec.reads  += is_write ? 0 : 1;
-    rec.writes += is_write ? 1 : 0;
-    if (is_write)
-        rec.write_mask |= (1ULL << (mem_addr & (CACHE_LINE_SIZE - 1)));
-    else
-        rec.read_mask  |= (1ULL << (mem_addr & (CACHE_LINE_SIZE - 1)));
-
-    //store instructon pointers in a list for up to MAX_TRACKED_IPS unique IPs
-    if (is_write && rec.write_ip_count < MAX_TRACKED_IPS) {
-        bool found = false;
+    rec.writes++;
+    rec.write_mask |= (1ULL << (mem_addr & (CACHE_LINE_SIZE - 1)));
+    if (rec.write_ip_count < MAX_TRACKED_IPS) {
         for (uint8_t i = 0; i < rec.write_ip_count; i++)
-            if (rec.write_ips[i] == ip) { found = true; break; }
-        if (!found)
-            rec.write_ips[rec.write_ip_count++] = ip;
-    } else if (!is_write && rec.read_ip_count < MAX_TRACKED_IPS) {
-        bool found = false;
-        for (uint8_t i = 0; i < rec.read_ip_count; i++)
-            if (rec.read_ips[i] == ip) { found = true; break; }
-        if (!found)
-            rec.read_ips[rec.read_ip_count++] = ip;
+            if (rec.write_ips[i] == ip) return;
+        rec.write_ips[rec.write_ip_count++] = ip;
     }
 }
 
+//collect data if read operation
+VOID RecordRead(VOID* addr, ADDRINT ip, THREADID tid) {
+    if (g_sample_ctr[tid].val++ & (SAMPLE_RATE - 1)) return;
+    ADDRINT mem_addr   = (ADDRINT)addr;
+    ADDRINT cache_line = mem_addr & CACHE_LINE_MASK;
+
+    CacheLineRecord& rec = instrumentation_records[tid].try_emplace(cache_line).first->second;
+
+    rec.reads++;
+    rec.read_mask |= (1ULL << (mem_addr & (CACHE_LINE_SIZE - 1)));
+    if (rec.read_ip_count < MAX_TRACKED_IPS) {
+        for (uint8_t i = 0; i < rec.read_ip_count; i++)
+            if (rec.read_ips[i] == ip) return;
+        rec.read_ips[rec.read_ip_count++] = ip;
+    }
+}
+
+//pass instruction data to correct method
 VOID Instruction(INS ins, VOID* v) {
     if (INS_IsMemoryWrite(ins)) {
         INS_InsertPredicatedCall(
-            ins,
-            IPOINT_BEFORE,
-            (AFUNPTR)RecordAccess,
-            IARG_MEMORYWRITE_EA,
-            IARG_BOOL, TRUE,
-            IARG_INST_PTR,
-            IARG_THREAD_ID,
-            IARG_END
-        );
+            ins, IPOINT_BEFORE, (AFUNPTR)RecordWrite,
+            IARG_MEMORYWRITE_EA, IARG_INST_PTR, IARG_THREAD_ID,
+            IARG_END);
     }
-
     if (INS_IsMemoryRead(ins)) {
         INS_InsertPredicatedCall(
-            ins,
-            IPOINT_BEFORE,
-            (AFUNPTR)RecordAccess,
-            IARG_MEMORYREAD_EA,
-            IARG_BOOL, FALSE,
-            IARG_INST_PTR,
-            IARG_THREAD_ID,
-            IARG_END
-        );
+            ins, IPOINT_BEFORE, (AFUNPTR)RecordRead,
+            IARG_MEMORYREAD_EA, IARG_INST_PTR, IARG_THREAD_ID,
+            IARG_END);
     }
-
     if (INS_HasMemoryRead2(ins)) {
         INS_InsertPredicatedCall(
-            ins,
-            IPOINT_BEFORE,
-            (AFUNPTR)RecordAccess,
-            IARG_MEMORYREAD2_EA,
-            IARG_BOOL, FALSE,
-            IARG_INST_PTR,
-            IARG_THREAD_ID,
-            IARG_END
-        );
+            ins, IPOINT_BEFORE, (AFUNPTR)RecordRead,
+            IARG_MEMORYREAD2_EA, IARG_INST_PTR, IARG_THREAD_ID,
+            IARG_END);
     }
 }
 
-
-
+//do analysis on collected data and print results at the end of the program execution
 VOID Fini(INT32 code, VOID* v) {
     std::map<ADDRINT, std::map<int, const CacheLineRecord*>> by_line;
     uint64_t total_writes = 0; //sum all writes for reporting
@@ -221,7 +210,7 @@ VOID Fini(INT32 code, VOID* v) {
     std::cerr << "[detector] done. total writes observed: " << total_writes << "\n";
     std::cerr << "[detector] done. total reads observed: " << total_reads << "\n";
 
-    // write IP dump for source_lookup to resolve IPs -> file:line via DWARF
+    // write IP dump for source_lookup to resolve IPs -> file:line via DWARF and source_lookup.cpp
     FILE* dump = fopen(KnobIpDump.Value().c_str(), "w");
     if (dump) {
         for (auto& img : g_images)
