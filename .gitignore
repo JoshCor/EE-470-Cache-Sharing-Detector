@@ -47,8 +47,7 @@
 # log files for tool
 logs
 pin.log
-testfile.bin
-testfile.bin.bz2
+testfile.*
 
 # the binary for the testing file
 false_sharing_benchmark

@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <elfutils/libdwfl.h>
 #include <elfutils/libdw.h>
 #include <dwarf.h>
@@ -120,6 +121,36 @@ int main(int argc, char* argv[]) {
             const char* sym = mod ? dwfl_module_addrname(mod, (Dwarf_Addr)ip) : nullptr;
             printf("thread %d  %-5s  0x%lx  ->  (no src - near symbol: %s)\n",
                    tid, type, ip, sym ? sym : "unknown");
+        }
+
+        // parse and resolve any frame addresses after the IP on the same line
+        // format: "type tid 0xIP [0xF1 0xF2 ...]"
+        char *p = line;
+        for (int skip = 3; skip > 0; skip--) {              // skip type, tid, ip tokens
+            while (*p && !isspace((unsigned char)*p)) p++;
+            while (*p && isspace((unsigned char)*p)) p++;
+        }
+        int frame_num = 1;
+        while (*p && *p != '\n') {
+            char *end;
+            unsigned long faddr = strtoul(p, &end, 0);
+            if (end == p) break;
+            p = end;
+
+            Dwfl_Line* fl = dwfl_getsrc(dwfl, (Dwarf_Addr)faddr);
+            if (fl) {
+                int ln, col;
+                const char* fn = dwfl_lineinfo(fl, NULL, &ln, &col, NULL, NULL);
+                printf("    frame %d: 0x%lx  ->  %s:%d\n",
+                       frame_num, faddr, fn ? fn : "(unknown)", ln);
+                print_inline_chain(dwfl, (Dwarf_Addr)faddr);
+            } else {
+                Dwfl_Module* mod = dwfl_addrmodule(dwfl, (Dwarf_Addr)faddr);
+                const char* sym = mod ? dwfl_module_addrname(mod, (Dwarf_Addr)faddr) : nullptr;
+                printf("    frame %d: 0x%lx  ->  (no src - near symbol: %s)\n",
+                       frame_num, faddr, sym ? sym : "unknown");
+            }
+            frame_num++;
         }
     } while (fgets(line, sizeof(line), fp));
 

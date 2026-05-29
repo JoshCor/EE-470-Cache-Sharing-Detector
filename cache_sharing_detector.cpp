@@ -16,6 +16,7 @@ KNOB<std::string> KnobIpDump(KNOB_MODE_WRITEONCE, "pintool",
 #define WRITE_THRESHOLD_PERCENTAGE 0.02 //percentage threshold for hotspot
 
 #define MAX_TRACKED_IPS 8
+#define MAX_FRAMES      5          // call frames captured above each unique IP
 #define SAMPLE_RATE     1          // record 1-in-N accesses; must be a power of two
 
 struct CacheLineRecord {
@@ -36,14 +37,35 @@ struct ImageInfo { std::string path; ADDRINT load_base; };
 static std::unordered_map<ADDRINT, CacheLineRecord> instrumentation_records[MAX_THREADS];
 static SampleCounter g_sample_ctr[MAX_THREADS];
 static std::vector<ImageInfo> g_images;
+struct FrameStack { ADDRINT f[MAX_FRAMES]; };
+// Per-thread: IP -> return addresses walking up from RBP at first-seen site
+static std::unordered_map<ADDRINT, FrameStack> g_ip_frames[MAX_THREADS];
 
 //load file and base address into vector for later use in source lookup with libdwfl
 VOID ImageLoad(IMG img, VOID* v) {
     g_images.push_back({IMG_Name(img), IMG_LowAddress(img)});
 }
 
+// Walk frame pointers from rbp to collect up to MAX_FRAMES return addresses.
+// Only runs once per unique (tid, ip) pair — amortized to nothing on the hot path.
+static VOID capture_frames(ADDRINT ip, ADDRINT rbp, THREADID tid) {
+    if (g_ip_frames[tid].count(ip)) return;
+    FrameStack fs = {};
+    ADDRINT cur = rbp;
+    for (int i = 0; i < MAX_FRAMES; i++) {
+        if (!cur) break;
+        ADDRINT ret = 0, next = 0;
+        if (PIN_SafeCopy(&ret,  (VOID*)(cur + sizeof(ADDRINT)), sizeof(ADDRINT)) != sizeof(ADDRINT)) break;
+        if (PIN_SafeCopy(&next, (VOID*)cur,                    sizeof(ADDRINT)) != sizeof(ADDRINT)) break;
+        if (!next || next <= cur) break;  // stack grows down; sanity guard
+        fs.f[i] = ret;
+        cur = next;
+    }
+    g_ip_frames[tid].emplace(ip, fs);
+}
+
 //collect data if write operation
-VOID RecordWrite(VOID* addr, ADDRINT ip, THREADID tid) {
+VOID RecordWrite(VOID* addr, ADDRINT ip, ADDRINT rbp, THREADID tid) {
     if (g_sample_ctr[tid].val++ & (SAMPLE_RATE - 1)) return;
     ADDRINT mem_addr   = (ADDRINT)addr;
     ADDRINT cache_line = mem_addr & CACHE_LINE_MASK;
@@ -56,11 +78,12 @@ VOID RecordWrite(VOID* addr, ADDRINT ip, THREADID tid) {
         for (uint8_t i = 0; i < rec.write_ip_count; i++)
             if (rec.write_ips[i] == ip) return;
         rec.write_ips[rec.write_ip_count++] = ip;
+        capture_frames(ip, rbp, tid);
     }
 }
 
 //collect data if read operation
-VOID RecordRead(VOID* addr, ADDRINT ip, THREADID tid) {
+VOID RecordRead(VOID* addr, ADDRINT ip, ADDRINT rbp, THREADID tid) {
     if (g_sample_ctr[tid].val++ & (SAMPLE_RATE - 1)) return;
     ADDRINT mem_addr   = (ADDRINT)addr;
     ADDRINT cache_line = mem_addr & CACHE_LINE_MASK;
@@ -73,6 +96,7 @@ VOID RecordRead(VOID* addr, ADDRINT ip, THREADID tid) {
         for (uint8_t i = 0; i < rec.read_ip_count; i++)
             if (rec.read_ips[i] == ip) return;
         rec.read_ips[rec.read_ip_count++] = ip;
+        capture_frames(ip, rbp, tid);
     }
 }
 
@@ -81,19 +105,19 @@ VOID Instruction(INS ins, VOID* v) {
     if (INS_IsMemoryWrite(ins)) {
         INS_InsertPredicatedCall(
             ins, IPOINT_BEFORE, (AFUNPTR)RecordWrite,
-            IARG_MEMORYWRITE_EA, IARG_INST_PTR, IARG_THREAD_ID,
+            IARG_MEMORYWRITE_EA, IARG_INST_PTR, IARG_REG_VALUE, LEVEL_BASE::REG_RBP, IARG_THREAD_ID,
             IARG_END);
     }
     if (INS_IsMemoryRead(ins)) {
         INS_InsertPredicatedCall(
             ins, IPOINT_BEFORE, (AFUNPTR)RecordRead,
-            IARG_MEMORYREAD_EA, IARG_INST_PTR, IARG_THREAD_ID,
+            IARG_MEMORYREAD_EA, IARG_INST_PTR, IARG_REG_VALUE, LEVEL_BASE::REG_RBP, IARG_THREAD_ID,
             IARG_END);
     }
     if (INS_HasMemoryRead2(ins)) {
         INS_InsertPredicatedCall(
             ins, IPOINT_BEFORE, (AFUNPTR)RecordRead,
-            IARG_MEMORYREAD2_EA, IARG_INST_PTR, IARG_THREAD_ID,
+            IARG_MEMORYREAD2_EA, IARG_INST_PTR, IARG_REG_VALUE, LEVEL_BASE::REG_RBP, IARG_THREAD_ID,
             IARG_END);
     }
 }
@@ -217,10 +241,22 @@ VOID Fini(INT32 code, VOID* v) {
             fprintf(dump, "image:%s:0x%lx\n", img.path.c_str(), (unsigned long)img.load_base);
         for (auto& hs : hotspots) {
             for (auto& [tid, rec] : hs.threads) {
-                for (uint8_t i = 0; i < rec->write_ip_count; i++)
-                    fprintf(dump, "write %d 0x%lx\n", tid, (unsigned long)rec->write_ips[i]);
-                for (uint8_t i = 0; i < rec->read_ip_count; i++)
-                    fprintf(dump, "read %d 0x%lx\n", tid, (unsigned long)rec->read_ips[i]);
+                for (uint8_t i = 0; i < rec->write_ip_count; i++) {
+                    fprintf(dump, "write %d 0x%lx", tid, (unsigned long)rec->write_ips[i]);
+                    auto it = g_ip_frames[tid].find(rec->write_ips[i]);
+                    if (it != g_ip_frames[tid].end())
+                        for (int fi = 0; fi < MAX_FRAMES; fi++)
+                            if (it->second.f[fi]) fprintf(dump, " 0x%lx", (unsigned long)it->second.f[fi]);
+                    fprintf(dump, "\n");
+                }
+                for (uint8_t i = 0; i < rec->read_ip_count; i++) {
+                    fprintf(dump, "read %d 0x%lx", tid, (unsigned long)rec->read_ips[i]);
+                    auto it = g_ip_frames[tid].find(rec->read_ips[i]);
+                    if (it != g_ip_frames[tid].end())
+                        for (int fi = 0; fi < MAX_FRAMES; fi++)
+                            if (it->second.f[fi]) fprintf(dump, " 0x%lx", (unsigned long)it->second.f[fi]);
+                    fprintf(dump, "\n");
+                }
             }
         }
         fclose(dump);
