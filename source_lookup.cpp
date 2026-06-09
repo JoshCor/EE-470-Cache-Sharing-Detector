@@ -2,68 +2,100 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <map>
+#include <string>
+#include <vector>
+#include <algorithm>
 #include <elfutils/libdwfl.h>
 #include <elfutils/libdw.h>
 #include <dwarf.h>
 
-// Reads an IP dump file produced by cache_sharing_detector and resolves each
-// instruction pointer to a source file:line using DWARF debug info via libdwfl.
-// Also walks inlined subroutine chains so compressed call sites are fully visible.
+// Reads an IP dump file produced by cache_sharing_detector and summarises
+// all resolved source locations, deduplicating by file:line.
 //
 // Usage: ./source_lookup <ip_dump_file>
-//
-// ip_dump format (written by the Pin tool):
-//   image:/path/to/binary:0x<load_base>     (one per loaded image)
-//   write <tid> 0x<hex ip>
-//   read  <tid> 0x<hex ip>
 
-// Walk DW_TAG_inlined_subroutine scopes at 'ip' and print the call chain.
-// Each inlined frame records the call site (file:line) where it was inlined.
-static void print_inline_chain(Dwfl *dwfl, Dwarf_Addr ip) {
+struct HitInfo {
+    int      count       = 0;
+    uint64_t thread_mask = 0;
+    bool     has_write   = false;
+    bool     has_read    = false;
+};
+
+static std::map<std::string, HitInfo> g_hits;
+static char g_source_prefix[4096] = "";  // dirname of the instrumented binary
+
+static void add_hit(const char* file, int line, int tid, bool is_write) {
+    if (!file || line <= 0) return;
+    if (g_source_prefix[0] && strncmp(file, g_source_prefix, strlen(g_source_prefix)) != 0) return;
+    char key[2048];
+    snprintf(key, sizeof(key), "%s:%d", file, line);
+    HitInfo& h = g_hits[key];
+    h.count++;
+    h.thread_mask |= (1ULL << tid);
+    if (is_write) h.has_write = true; else h.has_read = true;
+}
+
+// Print ±10 lines of source around lineno, marking the hot line with an arrow.
+static void print_source_context(const char* filepath, int lineno) {
+    FILE* f = fopen(filepath, "r");
+    if (!f) return;
+
+    int start = (lineno > 10) ? lineno - 10 : 1;
+    int end   = lineno + 10;
+    char buf[4096];
+    int cur = 0;
+
+    while (fgets(buf, sizeof(buf), f)) {
+        cur++;
+        if (cur < start) continue;
+        if (cur > end)   break;
+        size_t len = strlen(buf);
+        if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
+        if (cur == lineno)
+            printf("  \033[1;33m->%4d\033[0m  %s\n", cur, buf);
+        else
+            printf("    %4d  %s\n", cur, buf);
+    }
+    fclose(f);
+}
+
+static void collect_inline_chain(Dwfl *dwfl, Dwarf_Addr ip, int tid, bool is_write) {
     Dwfl_Module *mod = dwfl_addrmodule(dwfl, ip);
     if (!mod) return;
-
     Dwarf_Addr bias = 0;
     Dwarf *dwarf = dwfl_module_getdwarf(mod, &bias);
     if (!dwarf) return;
-
     Dwarf_Die cudie;
     if (!dwarf_addrdie(dwarf, ip - bias, &cudie)) return;
-
     Dwarf_Die *scopes = NULL;
     int n = dwarf_getscopes(&cudie, ip - bias, &scopes);
     if (n <= 0) return;
-
     for (int i = 0; i < n; i++) {
         if (dwarf_tag(&scopes[i]) != DW_TAG_inlined_subroutine) continue;
-
-        // name lives on the abstract origin DIE, not the inlined instance
-        const char *fname = "(unknown)";
-        Dwarf_Attribute attr;
-        Dwarf_Die origin;
-        if (dwarf_attr(&scopes[i], DW_AT_abstract_origin, &attr) &&
-            dwarf_formref_die(&attr, &origin))
-            fname = dwarf_diename(&origin);
-
-        // call site: file index + line number recorded by the compiler
         Dwarf_Word file_idx = 0, line_no = 0;
+        Dwarf_Attribute attr;
         if (dwarf_attr(&scopes[i], DW_AT_call_file, &attr))
             dwarf_formudata(&attr, &file_idx);
         if (dwarf_attr(&scopes[i], DW_AT_call_line, &attr))
             dwarf_formudata(&attr, &line_no);
-
-        // resolve file index through the CU's file table
         Dwarf_Files *files = NULL;
         size_t nfiles = 0;
-        const char *call_file = "(unknown)";
+        const char *call_file = NULL;
         if (dwarf_getsrcfiles(&cudie, &files, &nfiles) == 0 && file_idx < nfiles)
             call_file = dwarf_filesrc(files, file_idx, NULL, NULL);
-
-        printf("    ^ inlined from %s() at %s:%lu\n",
-               fname, call_file ? call_file : "(unknown)", (unsigned long)line_no);
+        add_hit(call_file, (int)line_no, tid, is_write);
     }
-
     free(scopes);
+}
+
+static void collect_ip(Dwfl *dwfl, Dwarf_Addr ip, int tid, bool is_write) {
+    Dwfl_Line *fl = dwfl_getsrc(dwfl, ip);
+    if (!fl) return;
+    int lineno, col;
+    const char *file = dwfl_lineinfo(fl, NULL, &lineno, &col, NULL, NULL);
+    add_hit(file, lineno, tid, is_write);
+    collect_inline_chain(dwfl, ip, tid, is_write);
 }
 
 int main(int argc, char* argv[]) {
@@ -75,7 +107,6 @@ int main(int argc, char* argv[]) {
     FILE* fp = fopen(argv[1], "r");
     if (!fp) { perror("fopen"); return 1; }
 
-    // --- init libdwfl ---
     static const Dwfl_Callbacks callbacks = {
         .find_elf       = dwfl_build_id_find_elf,
         .find_debuginfo = dwfl_standard_find_debuginfo,
@@ -83,78 +114,145 @@ int main(int argc, char* argv[]) {
     Dwfl* dwfl = dwfl_begin(&callbacks);
     dwfl_report_begin(dwfl);
 
-    // --- parse header: register all images with dwfl ---
     char line[4096];
+    GElf_Addr first_image_base = 0;
+    bool first_image = true;
     while (fgets(line, sizeof(line), fp)) {
         if (strncmp(line, "image:", 6) != 0) break;
-
         char* last_colon = strrchr(line, ':');
         if (!last_colon) continue;
-
         unsigned long load_base = 0;
         sscanf(last_colon + 1, "%lx", &load_base);
         *last_colon = '\0';
         const char* path = line + 6;
-
+        if (first_image) {
+            first_image_base = (GElf_Addr)load_base;
+            first_image = false;
+        }
         dwfl_report_elf(dwfl, path, path, -1, (GElf_Addr)load_base, false);
     }
     dwfl_report_end(dwfl, NULL, NULL);
 
-    // --- resolve IPs ---
-    printf("source locations from: %s\n\n", argv[1]);
+    // derive source prefix from the binary's DWARF DW_AT_comp_dir — works regardless
+    // of where the binary file itself lives
+    if (first_image_base) {
+        Dwfl_Module *binary_mod = dwfl_addrmodule(dwfl, first_image_base);
+        if (binary_mod) {
+            Dwarf_Addr bias = 0;
+            Dwarf *dwarf = dwfl_module_getdwarf(binary_mod, &bias);
+            if (dwarf) {
+                Dwarf_Off off = 0, next_off;
+                size_t hdr;
+                while (dwarf_nextcu(dwarf, off, &next_off, &hdr, NULL, NULL, NULL) == 0) {
+                    Dwarf_Die cudie;
+                    if (dwarf_offdie(dwarf, off + hdr, &cudie)) {
+                        Dwarf_Attribute attr;
+                        if (dwarf_attr(&cudie, DW_AT_comp_dir, &attr)) {
+                            const char *comp_dir = dwarf_formstring(&attr);
+                            if (comp_dir && comp_dir[0]) {
+                                strncpy(g_source_prefix, comp_dir, sizeof(g_source_prefix) - 1);
+                                break;
+                            }
+                        }
+                    }
+                    off = next_off;
+                }
+            }
+        }
+    }
 
     do {
         char type[8];
         int tid;
         unsigned long ip;
         if (sscanf(line, "%7s %d %lx", type, &tid, &ip) != 3) continue;
+        bool is_write = (strncmp(type, "write", 5) == 0);
 
-        Dwfl_Line* dwfl_line = dwfl_getsrc(dwfl, (Dwarf_Addr)ip);
-        if (dwfl_line) {
-            int lineno, col;
-            const char* filename = dwfl_lineinfo(dwfl_line, NULL, &lineno, &col, NULL, NULL);
-            printf("thread %d  %-5s  0x%lx  ->  %s:%d\n",
-                   tid, type, ip, filename ? filename : "(unknown)", lineno);
-            print_inline_chain(dwfl, (Dwarf_Addr)ip);
-        } else {
-            Dwfl_Module* mod = dwfl_addrmodule(dwfl, (Dwarf_Addr)ip);
-            const char* sym = mod ? dwfl_module_addrname(mod, (Dwarf_Addr)ip) : nullptr;
-            printf("thread %d  %-5s  0x%lx  ->  (no src - near symbol: %s)\n",
-                   tid, type, ip, sym ? sym : "unknown");
-        }
+        collect_ip(dwfl, (Dwarf_Addr)ip, tid, is_write);
 
-        // parse and resolve any frame addresses after the IP on the same line
-        // format: "type tid 0xIP [0xF1 0xF2 ...]"
+        // advance past "type tid ip" and parse any frame addresses
         char *p = line;
-        for (int skip = 3; skip > 0; skip--) {              // skip type, tid, ip tokens
+        for (int skip = 3; skip > 0; skip--) {
             while (*p && !isspace((unsigned char)*p)) p++;
             while (*p && isspace((unsigned char)*p)) p++;
         }
-        int frame_num = 1;
         while (*p && *p != '\n') {
             char *end;
             unsigned long faddr = strtoul(p, &end, 0);
             if (end == p) break;
             p = end;
-
-            Dwfl_Line* fl = dwfl_getsrc(dwfl, (Dwarf_Addr)faddr);
-            if (fl) {
-                int ln, col;
-                const char* fn = dwfl_lineinfo(fl, NULL, &ln, &col, NULL, NULL);
-                printf("    frame %d: 0x%lx  ->  %s:%d\n",
-                       frame_num, faddr, fn ? fn : "(unknown)", ln);
-                print_inline_chain(dwfl, (Dwarf_Addr)faddr);
-            } else {
-                Dwfl_Module* mod = dwfl_addrmodule(dwfl, (Dwarf_Addr)faddr);
-                const char* sym = mod ? dwfl_module_addrname(mod, (Dwarf_Addr)faddr) : nullptr;
-                printf("    frame %d: 0x%lx  ->  (no src - near symbol: %s)\n",
-                       frame_num, faddr, sym ? sym : "unknown");
-            }
-            frame_num++;
+            collect_ip(dwfl, (Dwarf_Addr)faddr, tid, is_write);
         }
     } while (fgets(line, sizeof(line), fp));
 
     fclose(fp);
     dwfl_end(dwfl);
+
+    // sort by hit count descending
+    std::vector<std::pair<std::string, HitInfo>> sorted(g_hits.begin(), g_hits.end());
+    std::sort(sorted.begin(), sorted.end(),
+        [](const std::pair<std::string, HitInfo>& a,
+           const std::pair<std::string, HitInfo>& b) {
+            return a.second.count > b.second.count;
+        });
+
+    printf("unique source locations from: %s\n", argv[1]);
+    printf("filtering to: %s/\n\n", g_source_prefix);
+    printf("%-6s  %-5s  %-14s  %s\n", "hits", "r/w", "threads", "location");
+    printf("%-6s  %-5s  %-14s  %s\n", "------", "-----", "--------------", "--------");
+
+    for (size_t i = 0; i < sorted.size(); i++) {
+        const std::string& loc  = sorted[i].first;
+        const HitInfo&     h    = sorted[i].second;
+
+        // build compact thread list
+        char threads[64] = "";
+        bool first = true;
+        for (int t = 0; t < 64; t++) {
+            if (!(h.thread_mask & (1ULL << t))) continue;
+            if (!first) strncat(threads, ",", sizeof(threads) - strlen(threads) - 1);
+            char tmp[8];
+            snprintf(tmp, sizeof(tmp), "%d", t);
+            strncat(threads, tmp, sizeof(threads) - strlen(threads) - 1);
+            first = false;
+        }
+
+        const char* rw = (h.has_write && h.has_read) ? "rw"
+                       : h.has_write                 ? "write"
+                                                     : "read";
+        printf("%-6d  %-5s  %-14s  %s\n", h.count, rw, threads, loc.c_str());
+    }
+
+    // --- source context for each hit location ---
+    printf("\n\033[1m=== source context ===\033[0m\n");
+    for (size_t i = 0; i < sorted.size(); i++) {
+        const std::string& loc = sorted[i].first;
+        const HitInfo&     h   = sorted[i].second;
+
+        // parse "filepath:lineno" from the key
+        size_t colon = loc.rfind(':');
+        if (colon == std::string::npos) continue;
+        std::string filepath = loc.substr(0, colon);
+        int lineno = std::stoi(loc.substr(colon + 1));
+
+        // build thread list for the header
+        char threads[64] = "";
+        bool first = true;
+        for (int t = 0; t < 64; t++) {
+            if (!(h.thread_mask & (1ULL << t))) continue;
+            if (!first) strncat(threads, ",", sizeof(threads) - strlen(threads) - 1);
+            char tmp[8];
+            snprintf(tmp, sizeof(tmp), "%d", t);
+            strncat(threads, tmp, sizeof(threads) - strlen(threads) - 1);
+            first = false;
+        }
+        const char* rw = (h.has_write && h.has_read) ? "rw"
+                       : h.has_write                 ? "write"
+                                                     : "read";
+        printf("\n\033[1m%s\033[0m  [%d hits, %s, threads %s]\n",
+               loc.c_str(), h.count, rw, threads);
+        print_source_context(filepath.c_str(), lineno);
+    }
+
     return 0;
 }

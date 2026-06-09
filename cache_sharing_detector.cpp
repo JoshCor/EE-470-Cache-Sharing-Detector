@@ -13,11 +13,18 @@ KNOB<std::string> KnobIpDump(KNOB_MODE_WRITEONCE, "pintool",
 #define CACHE_LINE_SIZE 64
 #define CACHE_LINE_MASK (~(ADDRINT)(CACHE_LINE_SIZE - 1))
 #define MAX_THREADS 64
-#define WRITE_THRESHOLD_PERCENTAGE 0.02 //percentage threshold for hotspot
 
-#define MAX_TRACKED_IPS 8
+// statistical choices to save time
+#define WRITE_THRESHOLD_PERCENTAGE 0.02 //percentage threshold for hotspot
+#define MAX_TRACKED_IPS 8 //how many instruction pointers to track per cache line per thread (for call stack capture and source lookup later)
 #define MAX_FRAMES      5          // call frames captured above each unique IP
-#define SAMPLE_RATE     1          // record 1-in-N accesses; must be a power of two
+//sample rate
+KNOB<UINT32> KnobSampleRate(KNOB_MODE_WRITEONCE, "pintool",
+    "sample_rate", "1", "record 1-in-N accesses (must be a power of two)");
+KNOB<BOOL> KnobFrames(KNOB_MODE_WRITEONCE, "pintool",
+    "frames", "1", "capture call stack frames for source lookup (disable with -frames 0 for performance)");
+
+static UINT32 g_sample_mask = 0;  // set in main() to (sample_rate - 1)
 
 struct CacheLineRecord {
     uint64_t reads;
@@ -64,14 +71,21 @@ static VOID capture_frames(ADDRINT ip, ADDRINT rbp, THREADID tid) {
     g_ip_frames[tid].emplace(ip, fs);
 }
 
-//collect data if write operation
-VOID RecordWrite(VOID* addr, ADDRINT ip, ADDRINT rbp, THREADID tid) {
-    if (g_sample_ctr[tid].val++ & (SAMPLE_RATE - 1)) return;
+//collect data if write operation and no stack frame data
+VOID RecordWrite(VOID* addr, THREADID tid) {
+    if (g_sample_ctr[tid].val++ & g_sample_mask) return;
     ADDRINT mem_addr   = (ADDRINT)addr;
     ADDRINT cache_line = mem_addr & CACHE_LINE_MASK;
-
     CacheLineRecord& rec = instrumentation_records[tid].try_emplace(cache_line).first->second;
+    rec.writes++;
+    rec.write_mask |= (1ULL << (mem_addr & (CACHE_LINE_SIZE - 1)));
+}
 
+VOID RecordWriteFrames(VOID* addr, ADDRINT ip, ADDRINT rbp, THREADID tid) {
+    if (g_sample_ctr[tid].val++ & g_sample_mask) return;
+    ADDRINT mem_addr   = (ADDRINT)addr;
+    ADDRINT cache_line = mem_addr & CACHE_LINE_MASK;
+    CacheLineRecord& rec = instrumentation_records[tid].try_emplace(cache_line).first->second;
     rec.writes++;
     rec.write_mask |= (1ULL << (mem_addr & (CACHE_LINE_SIZE - 1)));
     if (rec.write_ip_count < MAX_TRACKED_IPS) {
@@ -83,13 +97,20 @@ VOID RecordWrite(VOID* addr, ADDRINT ip, ADDRINT rbp, THREADID tid) {
 }
 
 //collect data if read operation
-VOID RecordRead(VOID* addr, ADDRINT ip, ADDRINT rbp, THREADID tid) {
-    if (g_sample_ctr[tid].val++ & (SAMPLE_RATE - 1)) return;
+VOID RecordRead(VOID* addr, THREADID tid) {
+    if (g_sample_ctr[tid].val++ & g_sample_mask) return;
     ADDRINT mem_addr   = (ADDRINT)addr;
     ADDRINT cache_line = mem_addr & CACHE_LINE_MASK;
-
     CacheLineRecord& rec = instrumentation_records[tid].try_emplace(cache_line).first->second;
+    rec.reads++;
+    rec.read_mask |= (1ULL << (mem_addr & (CACHE_LINE_SIZE - 1)));
+}
 
+VOID RecordReadFrames(VOID* addr, ADDRINT ip, ADDRINT rbp, THREADID tid) {
+    if (g_sample_ctr[tid].val++ & g_sample_mask) return;
+    ADDRINT mem_addr   = (ADDRINT)addr;
+    ADDRINT cache_line = mem_addr & CACHE_LINE_MASK;
+    CacheLineRecord& rec = instrumentation_records[tid].try_emplace(cache_line).first->second;
     rec.reads++;
     rec.read_mask |= (1ULL << (mem_addr & (CACHE_LINE_SIZE - 1)));
     if (rec.read_ip_count < MAX_TRACKED_IPS) {
@@ -102,23 +123,30 @@ VOID RecordRead(VOID* addr, ADDRINT ip, ADDRINT rbp, THREADID tid) {
 
 //pass instruction data to correct method
 VOID Instruction(INS ins, VOID* v) {
+    bool frames = KnobFrames.Value();
     if (INS_IsMemoryWrite(ins)) {
-        INS_InsertPredicatedCall(
-            ins, IPOINT_BEFORE, (AFUNPTR)RecordWrite,
-            IARG_MEMORYWRITE_EA, IARG_INST_PTR, IARG_REG_VALUE, LEVEL_BASE::REG_RBP, IARG_THREAD_ID,
-            IARG_END);
+        if (frames)
+            INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)RecordWriteFrames,
+                IARG_MEMORYWRITE_EA, IARG_INST_PTR, IARG_REG_VALUE, LEVEL_BASE::REG_RBP, IARG_THREAD_ID, IARG_END);
+        else
+            INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)RecordWrite,
+                IARG_MEMORYWRITE_EA, IARG_THREAD_ID, IARG_END);
     }
     if (INS_IsMemoryRead(ins)) {
-        INS_InsertPredicatedCall(
-            ins, IPOINT_BEFORE, (AFUNPTR)RecordRead,
-            IARG_MEMORYREAD_EA, IARG_INST_PTR, IARG_REG_VALUE, LEVEL_BASE::REG_RBP, IARG_THREAD_ID,
-            IARG_END);
+        if (frames)
+            INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)RecordReadFrames,
+                IARG_MEMORYREAD_EA, IARG_INST_PTR, IARG_REG_VALUE, LEVEL_BASE::REG_RBP, IARG_THREAD_ID, IARG_END);
+        else
+            INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)RecordRead,
+                IARG_MEMORYREAD_EA, IARG_THREAD_ID, IARG_END);
     }
     if (INS_HasMemoryRead2(ins)) {
-        INS_InsertPredicatedCall(
-            ins, IPOINT_BEFORE, (AFUNPTR)RecordRead,
-            IARG_MEMORYREAD2_EA, IARG_INST_PTR, IARG_REG_VALUE, LEVEL_BASE::REG_RBP, IARG_THREAD_ID,
-            IARG_END);
+        if (frames)
+            INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)RecordReadFrames,
+                IARG_MEMORYREAD2_EA, IARG_INST_PTR, IARG_REG_VALUE, LEVEL_BASE::REG_RBP, IARG_THREAD_ID, IARG_END);
+        else
+            INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)RecordRead,
+                IARG_MEMORYREAD2_EA, IARG_THREAD_ID, IARG_END);
     }
 }
 
@@ -154,11 +182,15 @@ VOID Fini(INT32 code, VOID* v) {
     for (auto& [cache_line, thread_to_record_map] : by_line) {
         if (thread_to_record_map.size() < 2) continue; // skip this cache line (only 1 thread)
 
-        //count writes
+        //count writes and reads
         uint64_t line_writes = 0;
-        for (auto& [tid, rec] : thread_to_record_map) //rec is a pointer to record
+        uint64_t line_reads  = 0;
+        for (auto& [tid, rec] : thread_to_record_map) {
             line_writes += rec->writes;
-        if (line_writes <= threshold) continue; //if total writes is less than threshold continue
+            line_reads  += rec->reads;
+        }
+        uint64_t read_threshold = total_reads / (uint64_t)(100.0 / WRITE_THRESHOLD_PERCENTAGE);
+        if (line_writes <= threshold && line_reads <= read_threshold) continue;
 
         //count sharing based on masks
         uint8_t write_bit_count[64] = {};
@@ -181,13 +213,22 @@ VOID Fini(INT32 code, VOID* v) {
         bool has_read_sharing      = false;
         for (int b = 0; b < 64; b++) {
             if (write_bit_count[b] >= 2) has_true_sharing = true;
-            if (write_bit_count[b] == 1) has_false_sharing = true;
             if (write_bit_count[b] == 0 && addr_bit_count[b] >= 2) has_read_sharing = true;
             if (write_bit_count[b] == 1)
                 for (auto& [tid, rec] : thread_to_record_map)
                     if ((rec->read_mask & (1ULL << b)) && !(rec->write_mask & (1ULL << b)))
                         has_producer_consumer = true;
         }
+        int exclusive_writers = 0;
+        for (auto& [tid, rec] : thread_to_record_map) {
+            for (int b = 0; b < 64; b++) {
+                if ((rec->write_mask & (1ULL << b)) && write_bit_count[b] == 1) {
+                    exclusive_writers++;
+                    break;
+                }
+            }
+        }
+        has_false_sharing = (exclusive_writers >= 2);
 
         hotspots.push_back({cache_line, line_writes, has_false_sharing, has_true_sharing,
                             has_producer_consumer, has_read_sharing, thread_to_record_map});
@@ -224,6 +265,16 @@ VOID Fini(INT32 code, VOID* v) {
             std::cerr << "    thread " << tid
                       << ": " << rec->writes << " writes, "
                       << rec->reads  << " reads\n";
+            // per-byte access map: B=read+write W=write-only R=read-only .=none
+            // grouped into 8-byte blocks matching a cache line's natural structure
+            std::cerr << "      ";
+            for (int b = 0; b < 64; b++) {
+                if (b > 0 && b % 8 == 0) std::cerr << ' ';
+                bool w = (rec->write_mask >> b) & 1;
+                bool r = (rec->read_mask  >> b) & 1;
+                std::cerr << (w && r ? 'B' : w ? 'W' : r ? 'R' : '.');
+            }
+            std::cerr << "\n";
         }
     }
 
@@ -234,6 +285,9 @@ VOID Fini(INT32 code, VOID* v) {
     std::cerr << "[detector] done. total writes observed: " << total_writes << "\n";
     std::cerr << "[detector] done. total reads observed: " << total_reads << "\n";
 
+    //=========================================================
+    //SEND OFF DATA FOR SOURCE LOOKUP
+    //=========================================================
     // write IP dump for source_lookup to resolve IPs -> file:line via DWARF and source_lookup.cpp
     FILE* dump = fopen(KnobIpDump.Value().c_str(), "w");
     if (dump) {
@@ -264,11 +318,45 @@ VOID Fini(INT32 code, VOID* v) {
     } else {
         std::cerr << "[detector] warning: could not open IP dump file: " << KnobIpDump.Value() << "\n";
     }
+
+    // write stats CSV alongside the ipdump (replace -ips.txt suffix)
+    std::string stats_path = KnobIpDump.Value();
+    size_t sfx = stats_path.rfind("-ips.txt");
+    if (sfx != std::string::npos) stats_path.replace(sfx, 8, "-stats.csv");
+    else                          stats_path += "-stats.csv";
+
+    FILE* stats = fopen(stats_path.c_str(), "w");
+    if (stats) {
+        fprintf(stats, "rank,sharing,hotspot_writes,tid,writes,reads,write_mask,read_mask,sample_rate\n");
+        int r = 0;
+        for (auto& hs : hotspots) {
+            r++;
+            std::string sharing;
+            if (hs.has_true_sharing)      { sharing += "true_sharing"; }
+            if (hs.has_false_sharing)     { if (!sharing.empty()) sharing += "|"; sharing += "false_sharing"; }
+            if (hs.has_producer_consumer) { if (!sharing.empty()) sharing += "|"; sharing += "producer_consumer"; }
+            if (hs.has_read_sharing)      { if (!sharing.empty()) sharing += "|"; sharing += "read_sharing"; }
+            for (auto& [tid, rec] : hs.threads) {
+                fprintf(stats, "%d,%s,%lu,%d,%lu,%lu,0x%016lx,0x%016lx,%u\n",
+                    r, sharing.c_str(),
+                    (unsigned long)hs.line_writes,
+                    tid,
+                    (unsigned long)rec->writes,
+                    (unsigned long)rec->reads,
+                    (unsigned long)rec->write_mask,
+                    (unsigned long)rec->read_mask,
+                    (unsigned)KnobSampleRate.Value());
+            }
+        }
+        fclose(stats);
+        std::cerr << "[detector] stats written to: " << stats_path << "\n";
+    }
 }
 
 int main(int argc, char* argv[]) {
     PIN_InitSymbols();
     PIN_Init(argc, argv);
+    g_sample_mask = KnobSampleRate.Value() - 1;
     IMG_AddInstrumentFunction(ImageLoad, nullptr);
     INS_AddInstrumentFunction(Instruction, nullptr);
     PIN_AddFiniFunction(Fini, nullptr);

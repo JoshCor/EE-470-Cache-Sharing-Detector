@@ -46,8 +46,12 @@
 
 # log files for tool
 logs
+plots
 pin.log
 testfile.*
+study.png
+studies
+.csd_history
 
 # the binary for the testing file
 false_sharing_benchmark
@@ -55,6 +59,10 @@ simple_benchmark
 source_lookup
 
 
+# python
+.venv
+__pycache__
 
-
-
+# extra stuff
+pbz2-original
+Saved
